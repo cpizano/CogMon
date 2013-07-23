@@ -93,12 +93,18 @@
       </PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_ASYNCRT_EXPORT;AZURESTORAGESERVICES_EXPORTS;_PPLX_EXPORT;WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src\pch;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+    <ProjectReference />
+    <Lib>
+      <AdditionalDependencies>winhttp.lib</AdditionalDependencies>
+    </Lib>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
@@ -125,7 +131,9 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_ASYNCRT_EXPORT;AZURESTORAGESERVICES_EXPORTS;_PPLX_EXPORT;WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src\pch;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -133,9 +141,34 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
     </Link>
+    <Lib>
+      <AdditionalDependencies>winhttp.lib</AdditionalDependencies>
+    </Lib>
   </ItemDefinitionGroup>
   <ItemGroup>
     <Text Include="ReadMe.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\http\client\http_msg_client.cpp" />
+    <ClCompile Include="src\http\client\http_win7.cpp" />
+    <ClCompile Include="src\http\common\http_helpers.cpp" />
+    <ClCompile Include="src\http\common\http_msg.cpp" />
+    <ClCompile Include="src\http\listener\http_listener.cpp" />
+    <ClCompile Include="src\http\listener\http_msg_listen.cpp" />
+    <ClCompile Include="src\http\listener\http_server_api.cpp" />
+    <ClCompile Include="src\http\listener\http_windows_server.cpp" />
+    <ClCompile Include="src\http\logging\log.cpp" />
+    <ClCompile Include="src\http\uri\uri.cpp" />
+    <ClCompile Include="src\http\uri\uri_builder.cpp" />
+    <ClCompile Include="src\http\uri\uri_parser.cpp" />
+    <ClCompile Include="src\json\json.cpp" />
+    <ClCompile Include="src\pch\stdafx.cpp" />
+    <ClCompile Include="src\pplx\pplx.cpp" />
+    <ClCompile Include="src\pplx\windows\pplxwin.cpp" />
+    <ClCompile Include="src\streams\windows\fileio.cpp" />
+    <ClCompile Include="src\streams\windows\ioscheduler.cpp" />
+    <ClCompile Include="src\utilities\asyncrt_utils.cpp" />
+    <ClCompile Include="src\utilities\base64.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
