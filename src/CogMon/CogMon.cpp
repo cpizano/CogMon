@@ -29,6 +29,14 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
   auto url = uri_builder(U("/search")).append_query(U("q"), searchTerm).to_string();
   auto rq = client.request(methods::GET, url);
   auto status = rq.wait();
+  auto response = rq.get();
+  if (200 != response.status_code()) {
+    return 1;
+  }
+  auto body = response.body();
+  response.extract_string().then([](string_t str) {
+    auto str2 = str;
+  }).wait();
 
   MSG msg = {0};
 	while (::GetMessageW(&msg, NULL, 0, 0)) {
