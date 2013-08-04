@@ -1,8 +1,9 @@
 // CogMon.cpp.
 
-#define WIN32_LEAN_AND_MEAN
 #include <SDKDDKVer.h>
-#include <windows.h>
+
+#include <winsock2.h>
+#include <iphlpapi.h>
 
 #include "CogMon.h"
 
@@ -16,6 +17,8 @@
 #include <cpprest/json.h>
 
 #pragma comment(lib, "casablanca.lib")
+#pragma comment(lib, "IPHLPAPI.lib")
+
 
 using namespace concurrency::streams;
 using namespace utility;
@@ -88,6 +91,28 @@ private:
   uint64_t luid_;
 };
 
+bool GetMacAddress(uint64_t& mac) {
+  unsigned long buflen = 1024*5;
+  std::unique_ptr<IP_ADAPTER_ADDRESSES> addrs(reinterpret_cast<IP_ADAPTER_ADDRESSES*>(new char[buflen]));
+  unsigned long flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_FRIENDLY_NAME;
+  unsigned long rc = GetAdaptersAddresses(AF_INET, flags, NULL, addrs.get(), &buflen);
+  if (rc != NO_ERROR)
+    return false;
+  IP_ADAPTER_ADDRESSES* adapter = addrs.get();
+  while (adapter) {
+    if (adapter->OperStatus != IfOperStatusUp)
+      continue;
+    if ((adapter->IfType != IF_TYPE_ETHERNET_CSMACD) && (adapter->IfType != IF_TYPE_IEEE80211))
+      continue;
+    if (!adapter->PhysicalAddressLength)
+      continue;
+    mac = *reinterpret_cast<uint64_t*>(&adapter->PhysicalAddress[0]);
+    return true;
+  }
+
+  return false;
+}
+
 
 bool CheckForUpdates(const string_t& server, uri& update_url, int32_t& version) {
   http_client client(server);
@@ -138,7 +163,15 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
   uint64_t uuid = GetLocalUniqueId();
   Logger logger(L"cogmon_logs", uuid);
 
-  logger(log_level::LOG_INFO, Logger::sys_updater) << "starting updater url: " << kServer;
+  uint64_t mac_addr = 0;
+  GetMacAddress(mac_addr);
+
+  logger(log_level::LOG_INFO, Logger::sys_updater) 
+      << "starting updater url: " << kServer
+      << " mac address: " << std::hex << mac_addr;
+
+  if (!mac_addr)
+    return 1;
 
   int32_t current_version = -1;
   int32_t version;
