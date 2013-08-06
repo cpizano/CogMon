@@ -27,16 +27,19 @@ using namespace web::http;
 using namespace web::http::client;
 using namespace utility::experimental::logging;
 
+typedef std::basic_ostringstream<string_t> OstringStream;
+
 // casablanca needs this, there it goes in dllmain.
 volatile long g_isProcessTerminating = 0;
 
-const auto kCogId = U("BA234588134");
 //const auto kServer = U("http://cogsrv.appspot.com/");
 const auto kServer = U("http://localhost:8080/");
 
-const unsigned long kWaits_mins[] = {
+const unsigned long kWaits_NoUpdate_mins[] = {
   0, 2, 8, 16, 32, 64, 128, 256
 };
+
+const unsigned long kWait_Update_mins = 5;
 
 class Logger {
 public:
@@ -114,9 +117,18 @@ bool GetMacAddress(uint64_t& mac) {
 }
 
 
-bool CheckForUpdates(const string_t& server, uri& update_url, int32_t& version) {
+bool CheckForUpdates(const string_t& server, uint64_t client_id, uri& update_url, int32_t& version) {
+
+  std::wostringstream oss1, oss2;
+  oss1 << std::hex << client_id;
+  oss2 << version;
+
+  auto url = uri_builder(U("/reg")).append_query(U("id"), oss1.str())
+                                   .append_query(U("tp"), "ucheck")
+                                   .append_query(U("ve"), oss2.str())
+                                   .to_string();
+
   http_client client(server);
-  auto url = uri_builder(U("/reg")).append_query(U("id"), kCogId).append_query(U("tp"), "ucheck").to_string();
   auto rq = client.request(methods::GET, url);
   auto status = rq.wait();
   auto response = rq.get();
@@ -147,8 +159,30 @@ bool CheckForUpdates(const string_t& server, uri& update_url, int32_t& version) 
   return true;
 }
 
-bool DownloadUpdate(const uri& url) {
-  return false;
+size_t DownloadUpdate(const uri& url, int32_t version) {
+  http_client client(url);
+  auto t1 = client.request(methods::GET, url.resource().to_string());
+  auto c1 = t1.then([](http_response& rs) {
+    bool sc = rs.status_code() == status_codes::OK;
+    return pplx::create_task([sc]() { return sc; });
+  });
+
+  auto t2 = file_buffer<uint8_t>::open(U("update_001.jpg"), std::ios::out);
+  auto c2 = t2.then([](streambuf<uint8_t>& filebuf) {
+    return pplx::create_task([]() { return true; });
+  });
+
+  size_t downloaded = 0;
+  (c1 && c2).then([&downloaded, t1, t2](std::vector<bool> result) {
+    if (result[0] && result[1]) {
+      t1.get().body().read_to_end(t2.get()).then([t2, &downloaded](size_t size) {
+        downloaded = size;
+        t2.get().close();
+      });
+    }
+  }).wait();
+
+  return downloaded;
 }
 
 uint64_t GetLocalUniqueId() {
@@ -174,29 +208,34 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
     return 1;
 
   int32_t current_version = -1;
-  int32_t version;
+  int32_t new_version = current_version;
   unsigned long loops = 0;
 
   while(true) {
     try {
 
-      unsigned long mins = kWaits_mins[loops % _countof(kWaits_mins)];
+      unsigned long mins = kWaits_NoUpdate_mins[loops % _countof(kWaits_NoUpdate_mins)];
       ::Sleep(mins * 60 * 1000);
       ++loops;
 
       uri url;
-      if (!CheckForUpdates(kServer, url, version)) {
+      if (!CheckForUpdates(kServer, mac_addr, url, new_version)) {
         continue;
       }
 
-      if (version <= current_version) {
-        logger(log_level::LOG_INFO, Logger::sys_updater) << "version is: " << version;
+#if 0
+      if (new_version <= current_version) {
+        logger(log_level::LOG_INFO, Logger::sys_updater) << "version is: " << new_version;
         continue;
+      }
+#endif
+
+      if (DownloadUpdate(url, new_version)) {
+        logger(log_level::LOG_INFO, Logger::sys_updater) << "download succesful";
+        ::Sleep(kWait_Update_mins * 60 * 1000);
       }
 
       loops = 0;
-      DownloadUpdate(url);
-      ::Sleep(5 * 60 * 1000);
 
     } catch(http_exception e) {
       logger(log_level::LOG_ERROR, Logger::sys_http) << "http exception: " << e.what();
