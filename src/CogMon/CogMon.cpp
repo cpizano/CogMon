@@ -56,6 +56,9 @@ public:
 
     ~LogNode() {
       log_.post(level_, code_, oss_.str());
+      if ((level_ == log_level::LOG_ERROR) || (level_ == log_level::LOG_FATAL)) {
+        if (::IsDebuggerPresent()) __debugbreak();
+      }
     }
 
     template <typename T>
@@ -68,8 +71,9 @@ public:
     
     LocalFileLog& log_;
     std::wostringstream oss_;
-    log_level level_;
-    int code_;
+
+    const log_level level_;
+    const int code_;
   };
 
   Logger(const string_t& folder, uint64_t luid)
@@ -102,7 +106,7 @@ bool GetMacAddress(uint64_t& mac) {
   if (rc != NO_ERROR)
     return false;
   IP_ADAPTER_ADDRESSES* adapter = addrs.get();
-  while (adapter) {
+  for ( ; adapter; adapter = adapter->Next) {
     if (adapter->OperStatus != IfOperStatusUp)
       continue;
     if ((adapter->IfType != IF_TYPE_ETHERNET_CSMACD) && (adapter->IfType != IF_TYPE_IEEE80211))
@@ -113,15 +117,24 @@ bool GetMacAddress(uint64_t& mac) {
     return true;
   }
 
+  // $$$ remove this.
+  mac = 1;
   return false;
 }
 
+struct UpdateInfo {
+  uri update_url;
+  int32_t version;
+  string_t path;
+  string_t options;
+};
 
-bool CheckForUpdates(const string_t& server, uint64_t client_id, uri& update_url, int32_t& version) {
+bool CheckForUpdates(Logger& logger, const string_t& server,
+                     uint64_t client_id, UpdateInfo& update_info) {
 
   std::wostringstream oss1, oss2;
   oss1 << std::hex << client_id;
-  oss2 << version;
+  oss2 << update_info.version;
 
   auto url = uri_builder(U("/reg")).append_query(U("id"), oss1.str())
                                    .append_query(U("tp"), "ucheck")
@@ -133,37 +146,62 @@ bool CheckForUpdates(const string_t& server, uint64_t client_id, uri& update_url
   auto status = rq.wait();
   auto response = rq.get();
   if (status_codes::OK != response.status_code()) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater)
+        << "code: " << response.status_code()
+        << "reason: " << response.reason_phrase();
     return false;
   }
 
-  version = -1;
-  string_t download;
-  response.extract_json().then([&download, &version](json::value dic) {
+  update_info.version = -1;
+  string_t download_url;
+  int required = 3;
+
+  response.extract_json().then([&download_url, &required, &update_info](json::value dic) {
     for (auto iter = dic.cbegin(); iter != dic.cend(); ++iter) {
       auto key = iter->first.as_string();
-	    if (key == U("update")) {
-        download = iter->second.as_string();
+	    if (key == U("Update")) {
+        download_url = iter->second.as_string();
+        --required;
         continue;
       }
-      if (key == U("version")) {
-        version = iter->second.as_integer();
+      else if (key == U("Version")) {
+        update_info.version = iter->second.as_integer();
+        --required;
+        continue;
+      }
+      else if (key == U("Path")) {
+        update_info.path = iter->second.as_string();
+        --required;
         continue;
       }
     }
   }).wait();
 
-  if (!uri::validate(download))
+  if (!uri::validate(download_url)) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater) << "invalid url : " << download_url;
     return false;
+  }
+
+  if (required) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater) << "missing json fields :" << required;
+    return false;
+  }
   
-  update_url = uri(download);
+  update_info.update_url = uri(download_url);
   return true;
 }
 
-size_t DownloadUpdate(const uri& url, int32_t version) {
-  http_client client(url);
-  auto t1 = client.request(methods::GET, url.resource().to_string());
-  auto c1 = t1.then([](http_response& rs) {
-    bool sc = rs.status_code() == status_codes::OK;
+size_t DownloadUpdate(Logger& logger, const UpdateInfo& update_info) {
+  logger(log_level::LOG_INFO, Logger::sys_updater)
+      << "downloading: " << update_info.update_url.to_string()
+      << " to :" << update_info.path;
+
+  http_client client(update_info.update_url);
+  string_t resource = update_info.update_url.resource().to_string();
+
+  auto t1 = client.request(methods::GET, resource);
+  auto c1 = t1.then([&logger](http_response& response) {
+    bool sc = response.status_code() == status_codes::OK;
     return pplx::create_task([sc]() { return sc; });
   });
 
@@ -182,6 +220,13 @@ size_t DownloadUpdate(const uri& url, int32_t version) {
     }
   }).wait();
 
+  if (!downloaded) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater)
+        << "download failed, server response was: " << t1.get().reason_phrase();
+
+  } else {
+    logger(log_level::LOG_INFO, Logger::sys_updater) << "downloaded OK, size: " << downloaded;
+  }
   return downloaded;
 }
 
@@ -207,8 +252,8 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
   if (!mac_addr)
     return 1;
 
-  int32_t current_version = -1;
-  int32_t new_version = current_version;
+  UpdateInfo update_info;
+  update_info.version = -1;
   unsigned long loops = 0;
 
   while(true) {
@@ -219,18 +264,11 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
       ++loops;
 
       uri url;
-      if (!CheckForUpdates(kServer, mac_addr, url, new_version)) {
+      if (!CheckForUpdates(logger, kServer, mac_addr, update_info)) {
         continue;
       }
 
-#if 0
-      if (new_version <= current_version) {
-        logger(log_level::LOG_INFO, Logger::sys_updater) << "version is: " << new_version;
-        continue;
-      }
-#endif
-
-      if (DownloadUpdate(url, new_version)) {
+      if (DownloadUpdate(logger, update_info)) {
         logger(log_level::LOG_INFO, Logger::sys_updater) << "download succesful";
         ::Sleep(kWait_Update_mins * 60 * 1000);
       }
