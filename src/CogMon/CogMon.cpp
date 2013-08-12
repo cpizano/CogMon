@@ -211,7 +211,7 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
         download_url = iter->second.as_string();
         --required;
       } else if (key == U("Component")) {
-        update_info.component = iter->second.to_string();
+        update_info.component = iter->second.as_string();
         --required;
       } else if (key == U("Version")) {
         update_info.version = iter->second.as_integer();
@@ -231,7 +231,7 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
     return false;
   }
 
-  if (required) {
+  if (required || update_info.name.empty() || update_info.component.empty()) {
     logger(log_level::LOG_ERROR, Logger::sys_updater) << "missing json fields :" << required;
     return false;
   }
@@ -254,10 +254,20 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
     return false;
   }
   
+  if (!::CreateDirectory(component_dir.Parent().Raw(), NULL)) {
+    if (::GetLastError() != ERROR_ALREADY_EXISTS) {
+      logger(log_level::LOG_FATAL, Logger::sys_prog)
+          << "failed to create component root directory: " << component_dir.Raw();
+      return false;
+    }
+  }
+
   if (!::CreateDirectory(component_dir.Raw(), NULL)) {
-    logger(log_level::LOG_FATAL, Logger::sys_prog)
-        << "failed to create component directory: " << component_dir.Raw();
-    return false;
+    if (::GetLastError() != ERROR_ALREADY_EXISTS) {
+      logger(log_level::LOG_FATAL, Logger::sys_prog)
+          << "failed to create component version directory: " << component_dir.Raw();
+      return false;
+    }
   }
 
   update_info.update_url = uri(download_url);
@@ -332,9 +342,11 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
     return 1;
 
   if(!::CreateDirectory(base_path.Append(U("downloads")).Raw(), NULL)) {
-    logger(log_level::LOG_FATAL, Logger::sys_prog)
-        << "failed to create downloads directory ";
-    return 1;
+    if (::GetLastError() != ERROR_ALREADY_EXISTS) {
+      logger(log_level::LOG_FATAL, Logger::sys_prog)
+          << "failed to create downloads directory , error: " << ::GetLastError();
+      return 1;
+    }
   }
 
   unsigned long loops = 0;
