@@ -41,11 +41,54 @@ const unsigned long kWaits_NoUpdate_mins[] = {
 
 const unsigned long kWait_Update_mins = 5;
 
+
+class FilePath {
+private:
+  std::wstring path_;
+  friend class File;
+
+public:
+  explicit FilePath(const wchar_t* path)
+    : path_(path) {
+  }
+
+  explicit FilePath(const std::wstring& path)
+    : path_(path) {
+  }
+
+  FilePath Parent() const {
+    auto pos = path_.find_last_of(L'\\');
+    if (pos == std::string::npos)
+      return FilePath();
+    return FilePath(path_.substr(0, pos));
+  }
+
+  FilePath Append(const std::wstring& name) const {
+    std::wstring full(path_);
+    if (!path_.empty())
+      full.append(1, L'\\');
+    full.append(name);
+    return FilePath(full);
+  }
+
+  const wchar_t* Raw() const { return path_.c_str(); }
+
+private:
+  FilePath() {}
+};
+
+FilePath GetExePath() {
+  wchar_t* pp = nullptr;
+  _get_wpgmptr(&pp);
+  return FilePath(pp).Parent();
+}
+
 class Logger {
 public:
   static const int sys_logger   = 0;
   static const int sys_http     = 1;
   static const int sys_updater  = 2;
+  static const int sys_prog     = 3;
 
   class LogNode {
   public:
@@ -76,8 +119,8 @@ public:
     const int code_;
   };
 
-  Logger(const string_t& folder, uint64_t luid)
-      : log_(folder), luid_(luid) {
+  Logger(const FilePath& path, uint64_t luid)
+      : log_(path.Raw()), luid_(luid) {
     LogNode(log_, log_level::LOG_INFO, sys_logger, luid_) 
         << "<< starting log session >> pid:" << ::GetCurrentProcessId()
         << " uptime:" <<::GetTickCount64() / 1000;
@@ -98,8 +141,8 @@ private:
   uint64_t luid_;
 };
 
-bool GetMacAddress(uint64_t& mac) {
-  unsigned long buflen = 1024*5;
+uint64_t GetMacAddress() {
+  unsigned long buflen = 1024*8;
   std::unique_ptr<IP_ADAPTER_ADDRESSES> addrs(reinterpret_cast<IP_ADAPTER_ADDRESSES*>(new char[buflen]));
   unsigned long flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_FRIENDLY_NAME;
   unsigned long rc = GetAdaptersAddresses(AF_INET, flags, NULL, addrs.get(), &buflen);
@@ -113,35 +156,41 @@ bool GetMacAddress(uint64_t& mac) {
       continue;
     if (!adapter->PhysicalAddressLength)
       continue;
-    mac = *reinterpret_cast<uint64_t*>(&adapter->PhysicalAddress[0]);
-    return true;
+    return *reinterpret_cast<uint64_t*>(&adapter->PhysicalAddress[0]);
   }
 
-  // $$$ remove this.
-  mac = 1;
-  return false;
+  // If we are not connected to a network, we use a 24 bit random number.
+  return ::GetTickCount() & 0xffffff;
 }
 
 struct UpdateInfo {
   uri update_url;
-  int32_t version;
+  string_t name;
+  string_t component;
   string_t path;
+  int32_t version;
   string_t options;
 };
 
-bool CheckForUpdates(Logger& logger, const string_t& server,
-                     uint64_t client_id, UpdateInfo& update_info) {
+struct NodeInfo {
+  uint64_t mac_addr;
+  uint64_t loc_uuid;
+  string_t server;
+  FilePath base_path;
+};
+
+bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_info) {
 
   std::wostringstream oss1, oss2;
-  oss1 << std::hex << client_id;
-  oss2 << update_info.version;
+  oss1 << std::hex << node.mac_addr;
+  oss2 << std::hex << node.loc_uuid;
 
-  auto url = uri_builder(U("/reg")).append_query(U("id"), oss1.str())
-                                   .append_query(U("tp"), "ucheck")
-                                   .append_query(U("ve"), oss2.str())
+  auto url = uri_builder(U("/reg")).append_query(U("mac"), oss1.str())
+                                   .append_query(U("uid"), oss2.str())
+                                   .append_query(U("tpc"), "ucheck1")
                                    .to_string();
 
-  http_client client(server);
+  http_client client(node.server);
   auto rq = client.request(methods::GET, url);
   auto status = rq.wait();
   auto response = rq.get();
@@ -152,27 +201,27 @@ bool CheckForUpdates(Logger& logger, const string_t& server,
     return false;
   }
 
-  update_info.version = -1;
   string_t download_url;
-  int required = 3;
+  int required = 4;
 
-  response.extract_json().then([&download_url, &required, &update_info](json::value dic) {
+  response.extract_json().then([&logger, &download_url, &required, &update_info](json::value dic) {
     for (auto iter = dic.cbegin(); iter != dic.cend(); ++iter) {
       auto key = iter->first.as_string();
 	    if (key == U("Update")) {
         download_url = iter->second.as_string();
         --required;
-        continue;
-      }
-      else if (key == U("Version")) {
+      } else if (key == U("Component")) {
+        update_info.component = iter->second.to_string();
+        --required;
+      } else if (key == U("Version")) {
         update_info.version = iter->second.as_integer();
         --required;
-        continue;
-      }
-      else if (key == U("Path")) {
-        update_info.path = iter->second.as_string();
+      } else if (key == U("Name")) {
+        update_info.name = iter->second.as_string();
         --required;
-        continue;
+      } else {
+        // Unknown field.
+        logger(log_level::LOG_WARNING, Logger::sys_updater) << "json unknown field: " << key;
       }
     }
   }).wait();
@@ -186,7 +235,31 @@ bool CheckForUpdates(Logger& logger, const string_t& server,
     logger(log_level::LOG_ERROR, Logger::sys_updater) << "missing json fields :" << required;
     return false;
   }
+
+  if (update_info.version < 0) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater) << "negative version :" << update_info.version;
+    return false;
+  }
+
+  std::wostringstream oss;
+  oss << update_info.version;
+  FilePath component_dir = node.base_path.Append(update_info.component).Append(oss.str());
+  update_info.path = component_dir.Append(update_info.name).Raw();
+
+  WIN32_FIND_DATA finddata = {0};
+  HANDLE h = ::FindFirstFile(update_info.path.c_str(), &finddata);
+  if (h != INVALID_HANDLE_VALUE) {
+    logger(log_level::LOG_INFO, Logger::sys_prog)
+        << "component is already here.: " << component_dir.Raw();
+    return false;
+  }
   
+  if (!::CreateDirectory(component_dir.Raw(), NULL)) {
+    logger(log_level::LOG_FATAL, Logger::sys_prog)
+        << "failed to create component directory: " << component_dir.Raw();
+    return false;
+  }
+
   update_info.update_url = uri(download_url);
   return true;
 }
@@ -196,7 +269,7 @@ size_t DownloadUpdate(Logger& logger, const UpdateInfo& update_info) {
       << "downloading: " << update_info.update_url.to_string()
       << " to :" << update_info.path;
 
-  http_client client(update_info.update_url);
+  http_client client(update_info.update_url.authority());
   string_t resource = update_info.update_url.resource().to_string();
 
   auto t1 = client.request(methods::GET, resource);
@@ -205,7 +278,11 @@ size_t DownloadUpdate(Logger& logger, const UpdateInfo& update_info) {
     return pplx::create_task([sc]() { return sc; });
   });
 
-  auto t2 = file_buffer<uint8_t>::open(U("update_001.jpg"), std::ios::out);
+  auto t2 = file_buffer<uint8_t>::open(update_info.path,
+                                       std::ios::out |
+                                       std::ios::binary |
+                                       std::ios::trunc);
+
   auto c2 = t2.then([](streambuf<uint8_t>& filebuf) {
     return pplx::create_task([]() { return true; });
   });
@@ -213,10 +290,8 @@ size_t DownloadUpdate(Logger& logger, const UpdateInfo& update_info) {
   size_t downloaded = 0;
   (c1 && c2).then([&downloaded, t1, t2](std::vector<bool> result) {
     if (result[0] && result[1]) {
-      t1.get().body().read_to_end(t2.get()).then([t2, &downloaded](size_t size) {
-        downloaded = size;
-        t2.get().close();
-      });
+      downloaded = t1.get().body().read_to_end(t2.get()).get();
+      t2.get().close();
     }
   }).wait();
 
@@ -239,35 +314,46 @@ uint64_t GetLocalUniqueId() {
 
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_show) {
 
-  uint64_t uuid = GetLocalUniqueId();
-  Logger logger(L"cogmon_logs", uuid);
+  uint64_t mac_addr = GetMacAddress();
+  uint64_t loc_uuid = GetLocalUniqueId();
+  
+  // This binary should be located at y\x\component\version\cogmon.exe and the base
+  // path should be x. On debug builds it is at CogMon\out\x64\Debug so the base
+  // path is |CogMon\out|. We need two directories to operate, |logs| and |downloads|.
 
-  uint64_t mac_addr = 0;
-  GetMacAddress(mac_addr);
+  FilePath base_path = GetExePath().Parent().Parent();
+  Logger logger(base_path.Append(U("logs")), loc_uuid);
 
-  logger(log_level::LOG_INFO, Logger::sys_updater) 
+  logger(log_level::LOG_INFO, Logger::sys_prog) 
       << "starting updater url: " << kServer
       << " mac address: " << std::hex << mac_addr;
 
   if (!mac_addr)
     return 1;
 
-  UpdateInfo update_info;
-  update_info.version = -1;
+  if(!::CreateDirectory(base_path.Append(U("downloads")).Raw(), NULL)) {
+    logger(log_level::LOG_FATAL, Logger::sys_prog)
+        << "failed to create downloads directory ";
+    return 1;
+  }
+
   unsigned long loops = 0;
+  const NodeInfo node = {mac_addr, loc_uuid, kServer, base_path};
 
   while(true) {
     try {
+
+      UpdateInfo update_info;
 
       unsigned long mins = kWaits_NoUpdate_mins[loops % _countof(kWaits_NoUpdate_mins)];
       ::Sleep(mins * 60 * 1000);
       ++loops;
 
       uri url;
-      if (!CheckForUpdates(logger, kServer, mac_addr, update_info)) {
+      if (!CheckForUpdates(logger, node, update_info)) {
         continue;
       }
-
+      
       if (DownloadUpdate(logger, update_info)) {
         logger(log_level::LOG_INFO, Logger::sys_updater) << "download succesful";
         ::Sleep(kWait_Update_mins * 60 * 1000);
@@ -279,6 +365,8 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
       logger(log_level::LOG_ERROR, Logger::sys_http) << "http exception: " << e.what();
     } catch(json::json_exception e) {
       logger(log_level::LOG_ERROR, Logger::sys_http) << "json exception: " << e.what();
+    } catch(std::exception e) {
+      logger(log_level::LOG_ERROR, Logger::sys_http) << "std exception: " << e.what();
     }
 
   }
