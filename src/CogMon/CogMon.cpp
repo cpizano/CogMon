@@ -36,7 +36,7 @@ volatile long g_isProcessTerminating = 0;
 const auto kServer = U("http://localhost:8080/");
 
 const unsigned long kWaits_NoUpdate_mins[] = {
-  0, 2, 8, 16, 32, 64, 128, 256
+  0, 1, 2, 8, 16, 32, 64, 128, 256
 };
 
 const unsigned long kWait_Update_mins = 5;
@@ -164,6 +164,14 @@ uint64_t GetMacAddress() {
 }
 
 struct UpdateInfo {
+  enum Action {
+    Unknown,
+    Download,
+    Execute,
+    Verify
+  };
+
+  Action action;
   uri update_url;
   string_t name;
   string_t component;
@@ -202,7 +210,7 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
   }
 
   string_t download_url;
-  int required = 4;
+  int required = 5;
 
   response.extract_json().then([&logger, &download_url, &required, &update_info](json::value dic) {
     for (auto iter = dic.cbegin(); iter != dic.cend(); ++iter) {
@@ -218,6 +226,17 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
         --required;
       } else if (key == U("Name")) {
         update_info.name = iter->second.as_string();
+        --required;
+      } else if (key == U("Action")) {
+        auto action = iter->second.as_string();
+        if (action == U("download"))
+          update_info.action = UpdateInfo::Download;
+        else if (action == U("execute"))
+          update_info.action = UpdateInfo::Execute;
+        else if (action == U("verify"))
+          update_info.action = UpdateInfo::Verify;
+        else
+          update_info.action = UpdateInfo::Unknown;
         --required;
       } else {
         // Unknown field.
@@ -328,6 +347,15 @@ bool DownloadUpdate(Logger& logger, const NodeInfo& node, const UpdateInfo& upda
   return true;
 }
 
+bool DoAction(Logger& logger, const UpdateInfo& info) {
+  if (info.action == UpdateInfo::Unknown) {
+    logger(log_level::LOG_INFO, Logger::sys_updater) << "unknown action";
+    return false;
+  }
+
+  return true;
+}
+
 uint64_t GetLocalUniqueId() {
   LUID luid = {0};
   ::AllocateLocallyUniqueId(&luid);
@@ -380,11 +408,9 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
       }
       
       if (DownloadUpdate(logger, node, update_info)) {
-        logger(log_level::LOG_INFO, Logger::sys_updater) << "download succesful";
-        ::Sleep(kWait_Update_mins * 60 * 1000);
+        loops = 0;
       }
 
-      loops = 0;
 
     } catch(http_exception e) {
       logger(log_level::LOG_ERROR, Logger::sys_http) << "http exception: " << e.what();
