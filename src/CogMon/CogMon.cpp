@@ -185,7 +185,60 @@ struct NodeInfo {
   uint64_t loc_uuid;
   string_t server;
   FilePath base_path;
+  HANDLE main_thread;
 };
+
+struct ApcContext {
+  enum Event {
+    HeartBeat,
+    ProcessExit
+  };
+
+  Logger* logger;
+  NodeInfo node;
+  UpdateInfo info;
+  Event event;
+  DWORD exit_code;
+
+  ApcContext(Logger* logger, const NodeInfo& node, const UpdateInfo& info)
+      : logger(logger), node(node), info(info) {
+  }
+};
+
+void __stdcall ApcCallBack(ULONG_PTR context) {
+  std::unique_ptr<ApcContext> ctx (reinterpret_cast<ApcContext*>(context));
+
+  Logger& logger = *ctx->logger;
+  logger(log_level::LOG_INFO, Logger::sys_prog)
+      << "processing apc event : " << ctx->event
+      << " for: " << ctx->info.component;
+
+  std::wostringstream oss1, oss2, oss3;
+  oss1 << std::hex << ctx->node.mac_addr;
+  oss2 << std::hex << ctx->node.loc_uuid;
+
+  oss3 << ctx->info.component << L':'
+       << ctx->info.version << L':' << std::hex << ctx->exit_code;
+
+  auto url = uri_builder(U("/inf")).append_query(U("mac"), oss1.str())
+                                   .append_query(U("uid"), oss2.str())
+                                   .append_query(U("tpc"), "p_end")
+                                   .append_query(U("nod"), oss3.str())
+                                   .to_string();
+
+  http_client client(ctx->node.server);
+  auto rq = client.request(methods::GET, url);
+  auto status = rq.wait();
+  auto response = rq.get();
+
+  if (status_codes::OK != response.status_code()) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater)
+        << "http 'inf' GET failed, code: " << response.status_code()
+        << " reason: " << response.reason_phrase();
+    return;
+  }
+
+}
 
 bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_info) {
 
@@ -204,8 +257,8 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
   auto response = rq.get();
   if (status_codes::OK != response.status_code()) {
     logger(log_level::LOG_ERROR, Logger::sys_updater)
-        << "code: " << response.status_code()
-        << "reason: " << response.reason_phrase();
+        << "http 'req' GET failed, code: " << response.status_code()
+        << " reason: " << response.reason_phrase();
     return false;
   }
 
@@ -325,7 +378,7 @@ bool DownloadUpdate(Logger& logger, const NodeInfo& node, const UpdateInfo& upda
     (c1 && c2).then([&downloaded, t1, t2](std::vector<bool> result) {
       if (result[0] && result[1]) {
         downloaded = t1.get().body().read_to_end(t2.get()).get();
-        t2.get().close();
+        t2.get().close().wait();
       }
     }).wait();
 
@@ -347,12 +400,42 @@ bool DownloadUpdate(Logger& logger, const NodeInfo& node, const UpdateInfo& upda
   return true;
 }
 
-bool DoAction(Logger& logger, const UpdateInfo& info) {
+bool DoAction(Logger& logger, const NodeInfo& node, const UpdateInfo& info) {
   if (info.action == UpdateInfo::Unknown) {
-    logger(log_level::LOG_INFO, Logger::sys_updater) << "unknown action";
+    logger(log_level::LOG_WARNING, Logger::sys_updater) << "unknown action";
     return false;
   }
 
+  if (info.action == UpdateInfo::Execute) {
+    DWORD cflags = 0;
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+    if (!::CreateProcess(info.path.c_str(), NULL, NULL, NULL, FALSE, cflags, NULL, NULL, &si, &pi)) {
+      auto error = ::GetLastError();
+      logger(log_level::LOG_ERROR, Logger::sys_updater) << "process exec failed, error: " << error;
+      return false;
+    }
+
+    logger(log_level::LOG_INFO, Logger::sys_updater) << "process started, pid: " << pi.dwProcessId;
+    ::CloseHandle(pi.hThread);
+
+    HANDLE process = pi.hProcess;
+    HANDLE thread = node.main_thread;
+    auto context = new ApcContext(&logger, node, info);
+
+    pplx::create_task([process, thread, context]() {
+      ::WaitForSingleObject(process, INFINITE);
+
+      context->event = ApcContext::ProcessExit;
+      ::GetExitCodeProcess(process, &context->exit_code);
+      ::CloseHandle(process);
+
+      // We'll continue processing the event once we get to sleep in the main thread.
+      ::QueueUserAPC(&ApcCallBack, thread, ULONG_PTR(context));
+      return true;
+    });
+
+  }
   return true;
 }
 
@@ -391,7 +474,8 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
   }
 
   unsigned long loops = 0;
-  const NodeInfo node = {mac_addr, loc_uuid, kServer, base_path};
+  HANDLE thread = ::OpenThread(THREAD_ALL_ACCESS, FALSE, ::GetCurrentThreadId());
+  const NodeInfo node = {mac_addr, loc_uuid, kServer, base_path, thread};
 
   while(true) {
     try {
@@ -399,17 +483,18 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
       UpdateInfo update_info;
 
       unsigned long mins = kWaits_NoUpdate_mins[loops % _countof(kWaits_NoUpdate_mins)];
-      ::Sleep(mins * 60 * 1000);
+      ::SleepEx(mins * 60 * 1000, TRUE);
       ++loops;
 
       uri url;
-      if (!CheckForUpdates(logger, node, update_info)) {
+      if (!CheckForUpdates(logger, node, update_info))
         continue;
-      }
       
-      if (DownloadUpdate(logger, node, update_info)) {
-        loops = 0;
-      }
+      if (!DownloadUpdate(logger, node, update_info))
+        continue;
+
+      loops = 0;
+      DoAction(logger, node, update_info);
 
 
     } catch(http_exception e) {
