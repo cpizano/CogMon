@@ -274,45 +274,58 @@ bool CheckForUpdates(Logger& logger, const NodeInfo& node, UpdateInfo& update_in
   return true;
 }
 
-size_t DownloadUpdate(Logger& logger, const UpdateInfo& update_info) {
+bool DownloadUpdate(Logger& logger, const NodeInfo& node, const UpdateInfo& update_info) {
+  std::wostringstream oss;
+  oss << std::hex << ::GetTickCount64();
+  string_t download_path = node.base_path.Append(L"downloads").Append(oss.str()).Raw();
+
   logger(log_level::LOG_INFO, Logger::sys_updater)
       << "downloading: " << update_info.update_url.to_string()
-      << " to :" << update_info.path;
+      << " to :" << download_path;
 
   http_client client(update_info.update_url.authority());
   string_t resource = update_info.update_url.resource().to_string();
-
-  auto t1 = client.request(methods::GET, resource);
-  auto c1 = t1.then([&logger](http_response& response) {
-    bool sc = response.status_code() == status_codes::OK;
-    return pplx::create_task([sc]() { return sc; });
-  });
-
-  auto t2 = file_buffer<uint8_t>::open(update_info.path,
-                                       std::ios::out |
-                                       std::ios::binary |
-                                       std::ios::trunc);
-
-  auto c2 = t2.then([](streambuf<uint8_t>& filebuf) {
-    return pplx::create_task([]() { return true; });
-  });
-
   size_t downloaded = 0;
-  (c1 && c2).then([&downloaded, t1, t2](std::vector<bool> result) {
-    if (result[0] && result[1]) {
-      downloaded = t1.get().body().read_to_end(t2.get()).get();
-      t2.get().close();
+
+  {
+    auto t1 = client.request(methods::GET, resource);
+    auto c1 = t1.then([&logger](http_response& response) {
+      bool sc = response.status_code() == status_codes::OK;
+      return pplx::create_task([sc]() { return sc; });
+    });
+
+    auto t2 = file_buffer<uint8_t>::open(download_path,
+                                         std::ios::out |
+                                         std::ios::binary |
+                                         std::ios::trunc);
+
+    auto c2 = t2.then([](streambuf<uint8_t>& filebuf) {
+      return pplx::create_task([]() { return true; });
+    });
+
+    (c1 && c2).then([&downloaded, t1, t2](std::vector<bool> result) {
+      if (result[0] && result[1]) {
+        downloaded = t1.get().body().read_to_end(t2.get()).get();
+        t2.get().close();
+      }
+    }).wait();
+
+    if (!downloaded) {
+      logger(log_level::LOG_ERROR, Logger::sys_updater)
+          << "download failed, server response was: " << t1.get().reason_phrase();
+      return false;
     }
-  }).wait();
-
-  if (!downloaded) {
-    logger(log_level::LOG_ERROR, Logger::sys_updater)
-        << "download failed, server response was: " << t1.get().reason_phrase();
-
-  } else {
-    logger(log_level::LOG_INFO, Logger::sys_updater) << "downloaded OK, size: " << downloaded;
   }
-  return downloaded;
+
+  logger(log_level::LOG_INFO, Logger::sys_updater) << "downloaded OK, size: " << downloaded;
+
+  if (!::MoveFile(download_path.c_str(), update_info.path.c_str())) {
+    auto error = ::GetLastError();
+    logger(log_level::LOG_ERROR, Logger::sys_updater) << "move file failed, error: " << error;
+    return false;
+  }
+
+  return true;
 }
 
 uint64_t GetLocalUniqueId() {
@@ -366,7 +379,7 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
         continue;
       }
       
-      if (DownloadUpdate(logger, update_info)) {
+      if (DownloadUpdate(logger, node, update_info)) {
         logger(log_level::LOG_INFO, Logger::sys_updater) << "download succesful";
         ::Sleep(kWait_Update_mins * 60 * 1000);
       }
