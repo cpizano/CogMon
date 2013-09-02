@@ -1,9 +1,20 @@
 // CogMon.cpp.
+//
+// TODO:
+// 0- Create a 'exit now' event with luid as name.
+// 1- Create a single instance event object
+// 2- Process json result from /inf request
+// 3- global structure to track processes launched
+// 4- if in /reg the exe exists but not running, launch it
+//
 
 #include <SDKDDKVer.h>
 
 #include <winsock2.h>
 #include <iphlpapi.h>
+#include <Wincrypt.h>
+#include <WinTrust.h>
+#include <SoftPub.h>
 
 #include "CogMon.h"
 
@@ -18,7 +29,8 @@
 
 #pragma comment(lib, "casablanca.lib")
 #pragma comment(lib, "IPHLPAPI.lib")
-
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "wintrust.lib")
 
 using namespace concurrency::streams;
 using namespace utility;
@@ -89,6 +101,7 @@ public:
   static const int sys_http     = 1;
   static const int sys_updater  = 2;
   static const int sys_prog     = 3;
+  static const int sys_crypto   = 4;
 
   class LogNode {
   public:
@@ -161,6 +174,68 @@ uint64_t GetMacAddress() {
 
   // If we are not connected to a network, we use a 24 bit random number.
   return ::GetTickCount() & 0xffffff;
+}
+
+std::wstring GetCertificateDescription(const CERT_CONTEXT* cert_ctx) {   
+  DWORD dwStrType = CERT_X500_NAME_STR;
+  DWORD dwCount = CertGetNameString(cert_ctx, CERT_NAME_RDN_TYPE, 0, &dwStrType, NULL, 0);
+  if (!dwCount){
+    return std::wstring();
+  }
+  std::unique_ptr<wchar_t> subjectRDN(new wchar_t[0, dwCount]);
+  CertGetNameString(cert_ctx, CERT_NAME_RDN_TYPE, 0, &dwStrType, subjectRDN.get(), dwCount);
+  return std::wstring(subjectRDN.get());
+}
+
+bool VerifyBinaryCert(Logger& logger, const FilePath& bin_path, std::vector<char>& cert_hash) {
+  WINTRUST_FILE_INFO wt_file_info = {sizeof(wt_file_info)};
+  WINTRUST_DATA wt_data = {sizeof(wt_data)};
+
+  wt_file_info.pcwszFilePath = bin_path.Raw();
+  wt_data.dwUIChoice          = WTD_UI_NONE;
+  wt_data.fdwRevocationChecks = WTD_REVOKE_NONE;
+  wt_data.dwUnionChoice       = WTD_CHOICE_FILE;
+  wt_data.pFile               = &wt_file_info;
+  wt_data.dwStateAction       = WTD_STATEACTION_VERIFY;
+
+  GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+  DWORD result = ::WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wt_data);
+
+  if (result != ERROR_SUCCESS) {
+    logger(log_level::LOG_ERROR, Logger::sys_crypto) 
+        << "WinVerifyTrust failed, result: " << std::hex << result;
+    return false;
+  }
+
+  // We don't trust the  root certs of a regular windows installation. If we did
+  // then we could end up executing any exe from a system32 folder send over to us.
+
+  CRYPT_PROVIDER_DATA *provdata = ::WTHelperProvDataFromStateData(wt_data.hWVTStateData);
+  if (!provdata) {
+    logger(log_level::LOG_ERROR, Logger::sys_crypto) << "CRYPT_PROVIDER_DATA is null";
+    return false;
+  }
+  
+  CRYPT_PROVIDER_SGNR *provsigner = ::WTHelperGetProvSignerFromChain(provdata, 0, FALSE, 0);
+  if (!provsigner) {
+    logger(log_level::LOG_ERROR, Logger::sys_crypto) << "CRYPT_PROVIDER_SGNR is null";
+    return false;
+  }
+
+  CRYPT_PROVIDER_CERT* provcert = WTHelperGetProvCertFromChain(provsigner, 0);
+  if (!provcert) {
+    logger(log_level::LOG_ERROR, Logger::sys_crypto) << "CRYPT_PROVIDER_CERT is null";
+    return false;
+  }
+
+  std::wstring name = GetCertificateDescription(provcert->pCert);
+  bool trusted = (name == L"CN=cogsoft2") && provcert->fSelfSigned && provcert->fTrustedRoot;
+
+  wt_data.dwUIChoice = WTD_UI_NONE;
+  wt_data.dwStateAction = WTD_STATEACTION_CLOSE;
+  WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wt_data);
+
+  return trusted;
 }
 
 struct UpdateInfo {
@@ -391,12 +466,19 @@ bool DownloadUpdate(Logger& logger, const NodeInfo& node, const UpdateInfo& upda
 
   logger(log_level::LOG_INFO, Logger::sys_updater) << "downloaded OK, size: " << downloaded;
 
+  std::vector<char> hash;
+  if (!VerifyBinaryCert(logger, FilePath(download_path), hash)) {
+    logger(log_level::LOG_ERROR, Logger::sys_updater) << "install aborted, authenticode failure";
+    return false;
+  }
+
   if (!::MoveFile(download_path.c_str(), update_info.path.c_str())) {
     auto error = ::GetLastError();
     logger(log_level::LOG_ERROR, Logger::sys_updater) << "move file failed, error: " << error;
     return false;
   }
 
+  logger(log_level::LOG_info, Logger::sys_updater) << "file installed, ready for action";
   return true;
 }
 
@@ -415,9 +497,8 @@ bool DoAction(Logger& logger, const NodeInfo& node, const UpdateInfo& info) {
       logger(log_level::LOG_ERROR, Logger::sys_updater) << "process exec failed, error: " << error;
       return false;
     }
-
-    logger(log_level::LOG_INFO, Logger::sys_updater) << "process started, pid: " << pi.dwProcessId;
     ::CloseHandle(pi.hThread);
+    logger(log_level::LOG_INFO, Logger::sys_updater) << "process started, pid: " << pi.dwProcessId;
 
     HANDLE process = pi.hProcess;
     HANDLE thread = node.main_thread;
@@ -425,12 +506,11 @@ bool DoAction(Logger& logger, const NodeInfo& node, const UpdateInfo& info) {
 
     pplx::create_task([process, thread, context]() {
       ::WaitForSingleObject(process, INFINITE);
-
+      // The process exited. We'll continue processing the event once we
+      // get to sleepex in the main thread.
       context->event = ApcContext::ProcessExit;
       ::GetExitCodeProcess(process, &context->exit_code);
       ::CloseHandle(process);
-
-      // We'll continue processing the event once we get to sleep in the main thread.
       ::QueueUserAPC(&ApcCallBack, thread, ULONG_PTR(context));
       return true;
     });
@@ -496,7 +576,6 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
       loops = 0;
       DoAction(logger, node, update_info);
 
-
     } catch(http_exception e) {
       logger(log_level::LOG_ERROR, Logger::sys_http) << "http exception: " << e.what();
     } catch(json::json_exception e) {
@@ -507,6 +586,7 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
 
   }
 
+  // required by casablanca framework.
   g_isProcessTerminating = 1;
 
 #if 0
