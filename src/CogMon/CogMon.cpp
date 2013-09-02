@@ -478,7 +478,7 @@ bool DownloadUpdate(Logger& logger, const NodeInfo& node, const UpdateInfo& upda
     return false;
   }
 
-  logger(log_level::LOG_info, Logger::sys_updater) << "file installed, ready for action";
+  logger(log_level::LOG_INFO, Logger::sys_updater) << "file installed, ready for action";
   return true;
 }
 
