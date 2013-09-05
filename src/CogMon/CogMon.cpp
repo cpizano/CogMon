@@ -6,6 +6,7 @@
 // 2- Process json result from /inf request
 // 3- global structure to track processes launched
 // 4- if in /reg the exe exists but not running, launch it
+// 5- if exception, copy log to dropbox.
 //
 
 #include <SDKDDKVer.h>
@@ -266,7 +267,8 @@ struct NodeInfo {
 struct ApcContext {
   enum Event {
     HeartBeat,
-    ProcessExit
+    ProcessExit,
+    SelfExit
   };
 
   Logger* logger;
@@ -278,6 +280,10 @@ struct ApcContext {
   ApcContext(Logger* logger, const NodeInfo& node, const UpdateInfo& info)
       : logger(logger), node(node), info(info) {
   }
+
+  ApcContext(Logger* logger, const NodeInfo& node) 
+      : logger(logger), node(node) {
+  }
 };
 
 void __stdcall ApcCallBack(ULONG_PTR context) {
@@ -287,6 +293,12 @@ void __stdcall ApcCallBack(ULONG_PTR context) {
   logger(log_level::LOG_INFO, Logger::sys_prog)
       << "processing apc event : " << ctx->event
       << " for: " << ctx->info.component;
+
+  if (ctx->event == ApcContext::SelfExit) {
+    logger(log_level::LOG_INFO, Logger::sys_prog) << "self exit by signal";
+    g_isProcessTerminating = 1;
+    return;
+  }
 
   std::wostringstream oss1, oss2, oss3;
   oss1 << std::hex << ctx->node.mac_addr;
@@ -492,7 +504,12 @@ bool DoAction(Logger& logger, const NodeInfo& node, const UpdateInfo& info) {
     DWORD cflags = 0;
     STARTUPINFO si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
-    if (!::CreateProcess(info.path.c_str(), NULL, NULL, NULL, FALSE, cflags, NULL, NULL, &si, &pi)) {
+
+    std::wostringstream oss;
+    oss << "creator:cogmon." << std::hex << node.loc_uuid;
+    wchar_t* cmdline = &oss.str()[0];
+
+    if (!::CreateProcess(info.path.c_str(), cmdline, NULL, NULL, FALSE, cflags, NULL, NULL, &si, &pi)) {
       auto error = ::GetLastError();
       logger(log_level::LOG_ERROR, Logger::sys_updater) << "process exec failed, error: " << error;
       return false;
@@ -526,6 +543,23 @@ uint64_t GetLocalUniqueId() {
   return li.QuadPart;
 }
 
+void CreateLifetimeMonitor(Logger& logger, const NodeInfo& node) {
+
+  std::wostringstream oss;
+  oss << "cog_" << std::hex << node.loc_uuid;
+  HANDLE event = ::CreateEventW(NULL, TRUE, FALSE, oss.str().c_str());
+  HANDLE thread = node.main_thread;
+  auto context = new ApcContext(&logger, node);
+
+  pplx::create_task([context, event, thread]() {
+      ::WaitForSingleObject(event, INFINITE);
+      context->event = ApcContext::SelfExit;
+      // Our lifetime handle got signaled. Exit when in the main loop.      
+      ::QueueUserAPC(&ApcCallBack, thread, ULONG_PTR(context));
+      return true;
+  });
+}
+
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_show) {
 
   uint64_t mac_addr = GetMacAddress();
@@ -553,20 +587,23 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
     }
   }
 
-  unsigned long loops = 0;
   HANDLE thread = ::OpenThread(THREAD_ALL_ACCESS, FALSE, ::GetCurrentThreadId());
   const NodeInfo node = {mac_addr, loc_uuid, kServer, base_path, thread};
 
+  CreateLifetimeMonitor(logger, node);
+
+  unsigned long loops = 0;
+
   while(true) {
     try {
-
-      UpdateInfo update_info;
-
       unsigned long mins = kWaits_NoUpdate_mins[loops % _countof(kWaits_NoUpdate_mins)];
       ::SleepEx(mins * 60 * 1000, TRUE);
       ++loops;
 
-      uri url;
+      if (g_isProcessTerminating)
+        break;
+
+      UpdateInfo update_info;
       if (!CheckForUpdates(logger, node, update_info))
         continue;
       
@@ -588,14 +625,5 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmdline, int n_sh
 
   // required by casablanca framework.
   g_isProcessTerminating = 1;
-
-#if 0
-  MSG msg = {0};
-	while (::GetMessageW(&msg, NULL, 0, 0)) {
-    ::TranslateMessage(&msg);
-    ::DispatchMessageW(&msg);
-	}
-
-	return (int) msg.wParam;
-#endif
+  return 0;
 }
